@@ -83,9 +83,6 @@ preset = st.sidebar.selectbox("Select a question", [
     "Best candidates for maggot therapy"
 ], index=0)
 
-# -----------------------------------------------------
-# PRESET → AUTO CONFIG
-# -----------------------------------------------------
 if preset != "Custom analysis":
     if "heal" in preset:
         heal_cols = [c for c in df.columns if any(k in c.lower() for k in ["heal","close","resolved","closure"])]
@@ -116,7 +113,7 @@ st.header("Predictive Modeling")
 
 binary_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() == 2 and c not in id_cols]
 
-chosen_target = st.selectbox("Select outcome", binary_cols, index=binary_cols.index(target) if target in binary_cols else 0)
+chosen_target = st.selectbox("Select outcome", binary_cols, index=binary_cols.index(target) if target and target in binary_cols else 0)
 
 col1, col2 = st.columns(2)
 with col1:
@@ -133,13 +130,11 @@ if st.button("Run Model", type="primary"):
 
     st.success(f"**AUC = {auc:.3f}**")
 
-    # Feature importance
     st.subheader("Top Predictive Features")
     fig, ax = plt.subplots(figsize=(10,6))
     imp.head(15).plot.bar(ax=ax, color="teal")
     st.pyplot(fig)
 
-    # SHAP explanation for a high-risk patient
     st.subheader("Why is this patient high-risk?")
     high_risk_idx = X_test[y_test == 1].index[0] if (y_test == 1).any() else X_test.index[0]
     explainer = shap.TreeExplainer(model)
@@ -152,7 +147,6 @@ if st.button("Run Model", type="primary"):
     st.pyplot(plt.gcf())
     plt.clf()
 
-    # Download predictions
     preds = model.predict_proba(df[imp.index])[:, 1]
     df_out = df.copy()
     df_out["Predicted_Risk"] = preds
@@ -187,7 +181,7 @@ if ABX_NAME_COL and ABX_INTERP_COL and microbe_cols:
         st.success("**Top microbes = best candidates for maggot therapy**")
 
 # -----------------------------------------------------
-# HELPER FUNCTIONS
+# FULLY IMPLEMENTED FUNCTIONS
 # -----------------------------------------------------
 def detect_leakage(X, y):
     leak = []
