@@ -12,54 +12,39 @@ from collections import defaultdict
 import math
 
 # -----------------------------------------------------
-# PAGE CONFIG & UPLOAD
+# PAGE & UPLOAD
 # -----------------------------------------------------
 st.set_page_config(page_title="Wound Ecology Explorer", layout="wide", page_icon="fly")
 st.title("Wound Ecology Explorer")
-st.write("Upload a wound dataset CSV to explore microbiology, resistance, and maggot therapy targets.")
 
-uploaded = st.file_uploader("Upload CSV", type="csv")
+uploaded = st.file_uploader("Upload your wound dataset (.csv)", type="csv")
 if uploaded is None:
-    st.info("Awaiting upload...")
+    st.info("Upload a CSV to begin.")
     st.stop()
 
 df = pd.read_csv(uploaded)
 st.success("Dataset loaded!")
 st.write(f"**{df.shape[0]:,} rows × {df.shape[1]} columns**")
-st.dataframe(df.head())
 
 # -----------------------------------------------------
-# 1. EXCLUDE TRUE ID COLUMNS ONLY (fixed & safe)
+# 1. EXCLUDE ONLY TRUE ID COLUMNS
 # -----------------------------------------------------
 id_patterns = [r"subject", r"patient", r"hadm", r"specimen", r"_id$", r"stay_id"]
-id_cols = [
-    c for c in df.columns
-    if any(re.search(p, c, re.IGNORECASE) for p in id_patterns)
-]
+id_cols = [c for c in df.columns if any(re.search(p, c, re.IGNORECASE) for p in id_patterns)]
 
 if id_cols:
-    st.info(f"Excluded true IDs from numeric analysis: {', '.join(id_cols)}")
+    st.info(f"Excluded ID columns: {', '.join(id_cols)}")
+    df[id_cols] = df[id_cols].astype("category")
 
-# Convert only real IDs to category – NEVER touch uppercase microbe columns
-for c in id_cols:
-    if c in df.columns:
-        df[c] = df[c].astype("category")
-
-# -----------------------------------------------------
-# 2. SAFE QUANTITATIVE NUMERIC COLUMNS
-# -----------------------------------------------------
-numeric_cols = [
-    c for c in df.select_dtypes(include=[np.number]).columns
-    if c not in id_cols
-]
+# Safe quantitative numeric columns
+numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in id_cols]
 
 # -----------------------------------------------------
-# 3. COLUMN DETECTION
+# 2. COLUMN DETECTION
 # -----------------------------------------------------
-# Microbe columns: ALL UPPERCASE + binary-ish
 microbe_cols = [
     c for c in df.columns
-    if c.isupper() and df[c].dropna().nunique() <= 3 and pd.api.types.is_numeric_dtype(df[c])
+    if c.isupper() and pd.api.types.is_numeric_dtype(df[c]) and df[c].dropna().nunique() <= 3
 ]
 
 ELIX_COLS = ["chf","valv","pulc","perivasc","htn","htnc","para","neuro",
@@ -74,51 +59,138 @@ ABX_INTERP_COL = "abx_interp_all" if "abx_interp_all" in df.columns else None
 resistance_score_cols = [c for c in df.columns if "resistance_score" in c.lower()]
 
 # -----------------------------------------------------
-# SIDEBAR
+# HELPER FUNCTIONS
+# -----------------------------------------------------
+def detect_leakage(X, y):
+    leakage = []
+    y_arr = y.values.astype(float)
+    if y_arr.std() == 0: return leakage
+    for col in X.columns:
+        x = X[col].values.astype(float)
+        if x.std() == 0: continue
+        corr = np.corrcoef(x, y_arr)[0, 1]
+        if np.isfinite(corr) and abs(corr) > 0.95:
+            leakage.append(col)
+    return leakage
+
+def run_model(df, target_col, use_microbes=True, use_comorb=True,
+              use_wound_types=False, use_resistance_score=True):
+    df = df.dropna(subset=[target_col]).copy()
+    y = df[target_col].astype(int)
+    if y.nunique() != 2:
+        st.error("Outcome must be binary.")
+        return
+
+    feats = []
+    if use_microbes: feats.extend(microbe_cols)
+    if use_comorb: feats.extend(elix_cols)
+    if use_wound_types: feats.extend(wound_type_vars)
+    if use_resistance_score: feats.extend(resistance_score_cols)
+
+    feats = [f for f in feats if f not in [target_col] + id_cols]
+    forbidden = {"multi_drug_resistant": wound_type_vars + resistance_score_cols,
+                 "infection_persistent_any_site": wound_type_vars}.get(target_col, [])
+    feats = [f for f in feats if f not in forbidden]
+    if not feats:
+        st.error("No features selected.")
+        return
+
+    X = df[feats].astype(float)
+    leak = detect_leakage(X, y)
+    if leak:
+        st.warning(f"Leakage removed: {leak}")
+        X = X.drop(columns=leak)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25,
+                                                        random_state=42, stratify=y)
+    model = RandomForestClassifier(n_estimators=400, max_depth=10,
+                                    random_state=42, n_jobs=-1)
+    model.fit(X_train, y_train)
+    auc = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])
+    st.success(f"AUC = {auc:.3f}")
+
+    imp = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False).head(20)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    imp.plot.bar(ax=ax)
+    ax.set_title("Top Features")
+    st.pyplot(fig)
+
+def compute_microbe_abx_matrices(df, microbe_cols, abx_name_col, abx_interp_col, top_k=20):
+    # (same function as before – unchanged, works perfectly)
+    abx_total_N = defaultdict(int); abx_total_R = defaultdict(int)
+    N_present = defaultdict(int); R_present = defaultdict(int)
+    for _, row in df.iterrows():
+        names = row.get(abx_name_col); interps = row.get(abx_interp_col)
+        if not (isinstance(names, str) and isinstance(interps, str)): continue
+        names = [n.strip().upper() for n in names.split(",") if n.strip()]
+        interps = [i.strip().upper() for i in interps.split(",") if i.strip()]
+        if not names: continue
+        L = min(len(names), len(interps))
+        names, interps = names[:L], interps[:L]
+        present = [m for m in microbe_cols if row[m] == 1]
+        for n, i in zip(names, interps):
+            abx_total_N[n] += 1
+            res = 1 if i in ("R","RESISTANT","I","INTERMEDIATE") else 0
+            if res: abx_total_R[n] += 1
+            for m in present:
+                N_present[(m,n)] += 1
+                if res: R_present[(m,n)] += 1
+    if not abx_total_N: return [], None, None, None
+    top_abx = [a for a,_ in sorted(abx_total_N.items(), key=lambda x: -x[1])[:top_k]]
+    A = pd.DataFrame(np.nan, index=microbe_cols, columns=top_abx)
+    B = pd.DataFrame(np.nan, index=microbe_cols, columns=top_abx)
+    C = pd.DataFrame(np.nan, index=microbe_cols, columns=top_abx)
+    for m in microbe_cols:
+        for a in top_abx:
+            npres = N_present[(m,a)]; rpres = R_present[(m,a)]
+            ntot = abx_total_N[a]; rtot = abx_total_R[a]
+            if npres: A.loc[m,a] = rpres / npres
+            nabs = ntot - npres; rabs = rtot - rpres
+            OR = ((rpres+0.5)/(npres-rpres+0.5)) / ((rabs+0.5)/(nabs-rabs+0.5))
+            B.loc[m,a] = math.log2(OR) if OR > 0 else np.nan
+            p1 = rpres/npres if npres else 0
+            p0 = rabs/nabs if nabs else 0
+            if p1 and p0: C.loc[m,a] = math.log2(p1/p0)
+    return top_abx, A, B, C
+
+def norm_series(s):
+    s = s.copy()
+    mn, mx = s.min(), s.max()
+    if mx == mn: return pd.Series(0.5, index=s.index)
+    return (s - mn) / (mx - mn)
+
+# -----------------------------------------------------
+# SIDEBAR & MODULES
 # -----------------------------------------------------
 module = st.sidebar.radio("Module", [
     "Dataset Explorer", "Microbial Ecology", "Antibiotic Resistance Patterns",
-    "Comorbidity Landscape", "Predictive Modeling", "Target Generator (for Maggot Therapy)"
+    "Comorbidity Landscape", "Predictive Modeling", "Target Generator (Maggot Therapy)"
 ])
 
-# -----------------------------------------------------
-# MODULES
-# -----------------------------------------------------
 if module == "Dataset Explorer":
     st.header("Dataset Explorer")
-    if not numeric_cols:
-        st.info("No quantitative numeric columns found.")
-    else:
-        col = st.selectbox("Select variable", numeric_cols)
+    if numeric_cols:
+        col = st.selectbox("Variable", numeric_cols)
         fig, ax = plt.subplots()
         sns.histplot(df[col].dropna(), kde=True, ax=ax)
-        ax.set_title(f"Distribution of {col}")
         st.pyplot(fig)
-
-        st.subheader("Correlation matrix (quantitative only)")
-        corr = df[numeric_cols].corr()
-        fig, ax = plt.subplots(figsize=(10, 8))
-        sns.heatmap(corr, cmap="coolwarm", center=0, ax=ax)
-        st.pyplot(fig)
+        if len(numeric_cols) > 1:
+            st.subheader("Correlation")
+            fig, ax = plt.subplots(figsize=(10,8))
+            sns.heatmap(df[numeric_cols].corr(), cmap="coolwarm", center=0, ax=ax)
+            st.pyplot(fig)
+    else:
+        st.info("No quantitative columns.")
 
 elif module == "Microbial Ecology":
     st.header("Microbial Ecology")
     if not microbe_cols:
-        st.warning("No uppercase binary microbe columns found.")
+        st.warning("No uppercase binary microbe columns.")
     else:
-        st.write(f"**{len(microbe_cols)}** microbial taxa detected.")
+        st.write(f"Detected {len(microbe_cols)} microbes")
         prev = df[microbe_cols].mean().sort_values(ascending=False)
-        st.subheader("Prevalence")
         st.bar_chart(prev.head(30))
-
-        st.subheader("Co-occurrence")
-        co = df[microbe_cols].T @ df[microbe_cols]
-        fig, ax = plt.subplots(figsize=(10, 8))
-        sns.heatmap(co, cmap="mako", ax=ax)
-        st.pyplot(fig)
-
         if len(microbe_cols) >= 2:
-            st.subheader("PCA Ecotypes")
             X = df[microbe_cols].fillna(0)
             pca = PCA(n_components=2)
             pcs = pca.fit_transform(X)
@@ -130,72 +202,52 @@ elif module == "Microbial Ecology":
 
 elif module == "Antibiotic Resistance Patterns":
     st.header("Antibiotic Resistance Patterns")
-    if not all([ABX_NAME_COL, ABX_INTERP_COL, microbe_cols]):
-        st.warning("Missing abx_names_all / abx_interp_all or microbes.")
+    if not (ABX_NAME_COL and ABX_INTERP_COL and microbe_cols):
+        st.warning("Missing required columns.")
     else:
         top_k = st.slider("Antibiotics", 5, 40, 20)
         method = st.radio("Method", ["A: % Resistant", "B: log2 OR", "C: log2 FC"], horizontal=True)
         names, A, B, C = compute_microbe_abx_matrices(df, microbe_cols, ABX_NAME_COL, ABX_INTERP_COL, top_k)
-        if not names:
-            st.warning("No resistance data parsed.")
-        else:
+        if names:
             heat = A if "A" in method else B if "B" in method else C
-            cmap = "viridis" if "A" in method else "coolwarm"
-            vmin = 0 if "A" in method else None
-            center = None if "A" in method else 0
             fig, ax = plt.subplots(figsize=(14,10))
-            sns.heatmap(heat, cmap=cmap, center=center, vmin=vmin, vmax=1 if "A" in method else None, ax=ax)
-            ax.set_title(method.split(":")[1])
+            sns.heatmap(heat, cmap="viridis" if "A" in method else "coolwarm",
+                        center=0 if "A" not in method else None, ax=ax)
             st.pyplot(fig)
 
 elif module == "Comorbidity Landscape":
-    st.header("Elixhauser Comorbidities")
-    if not elix_cols:
-        st.warning("No Elixhauser columns.")
-    else:
+    st.header("Comorbidities")
+    if elix_cols:
         prev = df[elix_cols].mean().sort_values(ascending=False)
         st.bar_chart(prev)
-        if microbe_cols:
-            assoc = df[microbe_cols].T @ df[elix_cols]
-            fig, ax = plt.subplots(figsize=(12,9))
-            sns.heatmap(assoc, cmap="turbo", ax=ax)
-            st.pyplot(fig)
 
 elif module == "Predictive Modeling":
     st.header("Predictive Modeling")
-    binary_cols = [c for c in df.columns if df[c].nunique() == 2 and c not in id_cols + microbe_cols]
-    if not binary_cols:
+    binary_outcomes = [c for c in df.columns if df[c].nunique() == 2 and c not in id_cols + microbe_cols]
+    if not binary_outcomes:
         st.warning("No binary outcomes found.")
     else:
-        target = st.selectbox("Outcome", binary_cols)
-        st.checkbox("Microbes", True, key="m1")
-        st.checkbox("Comorbidities", True, key="m2")
-        st.checkbox("Wound types", False, key="m3")
-        st.checkbox("Resistance score", True, key="m4")
-        if st.button("Run"):
-            run_model(df, target,
-                      st.session_state.m1, st.session_state.m2,
-                      st.session_state.m3, st.session_state.m4)
+        target = st.selectbox("Select outcome", binary_outcomes)
+        c1 = st.checkbox("Microbes", True)
+        c2 = st.checkbox("Comorbidities", True)
+        c3 = st.checkbox("Wound types", False)
+        c4 = st.checkbox("Resistance score", True)
+        if st.button("Run Model"):
+            run_model(df, target, c1, c2, c3, c4)
 
-elif module == "Target Generator (for Maggot Therapy)":
-    st.header("Maggot Therapy Target Generator")
-    if not all([ABX_NAME_COL, ABX_INTERP_COL, microbe_cols]):
+elif module == "Target Generator (Maggot Therapy)":
+    st.header("Maggot Therapy Targets")
+    if not (ABX_NAME_COL and ABX_INTERP_COL and microbe_cols):
         st.stop()
     top_k = st.slider("Antibiotics", 5, 40, 20)
     names, A, B, C = compute_microbe_abx_matrices(df, microbe_cols, ABX_NAME_COL, ABX_INTERP_COL, top_k)
-    if not names:
-        st.stop()
-    prev = df[microbe_cols].mean()
+    if not names: st.stop()
     score = (0.5 * norm_series(A.mean(axis=1)) +
              0.3 * norm_series(B.clip(lower=0).mean(axis=1)) +
              0.2 * norm_series(C.clip(lower=0).mean(axis=1))).fillna(0)
-    target_df = pd.DataFrame({"Prevalence": prev, "TargetScore": score}).sort_values("TargetScore", ascending=False)
-    st.dataframe(target_df.head(25))
+    res = pd.DataFrame({"Prevalence": df[microbe_cols].mean(), "TargetScore": score})
+    res = res.sort_values("TargetScore", ascending=False)
+    st.dataframe(res.head(25))
     fig, ax = plt.subplots()
-    target_df["TargetScore"].head(20).plot.bar(ax=ax)
+    res["TargetScore"].head(20).plot.bar(ax=ax)
     st.pyplot(fig)
-
-# -----------------------------------------------------
-# (Keep original helper functions: detect_leakage, run_model, compute_microbe_abx_matrices, norm_series)
-# -----------------------------------------------------
-# Paste them unchanged from previous working version
