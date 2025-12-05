@@ -26,7 +26,7 @@ import math
 # PAGE & UPLOAD
 # -----------------------------------------------------
 st.set_page_config(page_title="Wound Ecology Explorer", layout="wide", page_icon="fly")
-st.title("Wound Ecology Explorer")
+st.title("The Wound Machine")
 
 uploaded = st.file_uploader("Upload your wound dataset (.csv)", type="csv")
 if uploaded is None:
