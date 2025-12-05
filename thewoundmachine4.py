@@ -1,3 +1,14 @@
+# # The Wound Machine v4.0
+# Aram Mikaelyan, Department of Entomology and Plant Pathology, NCSU | amikael@ncsu.edu | http://www.mikaelyanlab.com
+# 
+# Description:
+#    Streamlit app for exploring the MIMIC wound dataset
+#
+#    The app is a scaling widget to visualize potential gigaton-scale impacts
+#
+# Reference:
+#    Mikaelyan & Welsh, in prep.
+###############
 import streamlit as st
 import pandas as pd
 import numpy as np
